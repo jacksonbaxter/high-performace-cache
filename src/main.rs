@@ -1,5 +1,5 @@
 use actix_web::{web, App, HttpServer, HttpResponse, Error as ActixError};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize};
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -131,23 +131,21 @@ impl CacheService {
         }
 
         // Try database
-        let result = sqlx::query!(
-            "SELECT data FROM cached_data WHERE key = $1",
-            key
+        let result = sqlx::query_as::<_, (Vec<u8>,)>(
+            "SELECT data FROM cached_data WHERE key = $1"
         )
+        .bind(key)
         .fetch_optional(&self.db)
         .await?;
 
         match result {
-            Some(row) => {
-                let data = row.data;
-                
+            Some((data,)) => {  // Note the tuple destructuring here
                 // Update both caches
                 let mut redis_conn = self.redis.get_async_connection().await?;
                 let _: () = redis_conn.set_ex(
                     key,
                     &data,
-                    self.config.redis_cache_ttl as usize,
+                    u64::from(self.config.redis_cache_ttl),
                 ).await?;
 
                 self.memory_cache.write().await.set(key.to_string(), data.clone());
@@ -161,12 +159,12 @@ impl CacheService {
 
     async fn set(&self, key: String, value: Vec<u8>) -> Result<(), CacheError> {
         // Update database
-        sqlx::query!(
+        sqlx::query(
             "INSERT INTO cached_data (key, data) VALUES ($1, $2) 
-             ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data",
-            key,
-            value
+             ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data"
         )
+        .bind(&key)
+        .bind(&value)
         .execute(&self.db)
         .await?;
 
@@ -175,7 +173,7 @@ impl CacheService {
         let _: () = redis_conn.set_ex(
             &key,
             &value,
-            self.config.redis_cache_ttl as usize,
+            u64::from(self.config.redis_cache_ttl),
         ).await?;
 
         // Update memory cache
@@ -186,7 +184,8 @@ impl CacheService {
 
     async fn delete(&self, key: &str) -> Result<(), CacheError> {
         // Remove from database
-        sqlx::query!("DELETE FROM cached_data WHERE key = $1", key)
+        sqlx::query("DELETE FROM cached_data WHERE key = $1")
+            .bind(key)
             .execute(&self.db)
             .await?;
 
@@ -243,33 +242,75 @@ async fn delete_cached_data(
     }
 }
 
-// Database migrations
-const MIGRATIONS: &str = r#"
--- Create cached_data table
-CREATE TABLE IF NOT EXISTS cached_data (
-    key VARCHAR(255) PRIMARY KEY,
-    data BYTEA NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
+async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
+    // Run migrations in a transaction
+    let mut transaction = pool.begin().await?;
 
--- Create updated_at trigger
-CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = CURRENT_TIMESTAMP;
-    RETURN NEW;
-END;
-$$ language 'plpgsql';
+    // Create the table
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS cached_data (
+            key VARCHAR(255) PRIMARY KEY,
+            data BYTEA NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(&mut *transaction)
+    .await?;
 
-CREATE TRIGGER update_cached_data_updated_at
-    BEFORE UPDATE ON cached_data
-    FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
+    // Create the trigger function
+    sqlx::query(
+        r#"
+        CREATE OR REPLACE FUNCTION update_updated_at_column()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            NEW.updated_at = CURRENT_TIMESTAMP;
+            RETURN NEW;
+        END;
+        $$ language 'plpgsql'
+        "#,
+    )
+    .execute(&mut *transaction)
+    .await?;
 
--- Create indexes
-CREATE INDEX IF NOT EXISTS idx_cached_data_updated_at ON cached_data(updated_at);
-"#;
+    // Drop the existing trigger if it exists
+    sqlx::query(
+        r#"
+        DROP TRIGGER IF EXISTS update_cached_data_updated_at ON cached_data
+        "#,
+    )
+    .execute(&mut *transaction)
+    .await?;
+
+    // Create the trigger
+    sqlx::query(
+        r#"
+        CREATE TRIGGER update_cached_data_updated_at
+            BEFORE UPDATE ON cached_data
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column()
+        "#,
+    )
+    .execute(&mut *transaction)
+    .await?;
+
+    // Create the index
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_cached_data_updated_at ON cached_data(updated_at)
+        "#,
+    )
+    .execute(&mut *transaction)
+    .await?;
+
+    // Commit the transaction
+    transaction.commit().await?;
+    
+    println!("Successfully ran all migrations");
+    Ok(())
+}
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -298,15 +339,17 @@ async fn main() -> std::io::Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt::init();
 
-    // Create and migrate database
+    // Create database pool
     let pool = PgPool::connect(&config.database_url)
         .await
         .expect("Failed to connect to database");
 
-    sqlx::query(MIGRATIONS)
-        .execute(&pool)
+    // Run migrations
+    run_migrations(&pool)
         .await
-        .expect("Failed to run migrations");
+        .expect("Failed to run database migrations");
+
+    println!("Database migrations completed successfully");
 
     // Initialize cache service
     let service = Arc::new(
@@ -314,6 +357,8 @@ async fn main() -> std::io::Result<()> {
             .await
             .expect("Failed to create cache service")
     );
+
+    println!("Starting HTTP server at http://127.0.0.1:8080");
 
     // Start HTTP server
     HttpServer::new(move || {
