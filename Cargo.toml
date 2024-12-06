@@ -3,6 +3,14 @@ name = "high-performance-cache"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[[bin]]
+name = "load_test"
+path = "src/bin/load_test.rs"
+
 [dependencies]
 actix-web = "4.4"
 tokio = { version = "1.36", features = ["full"] }
@@ -19,9 +27,10 @@ dotenv = "0.15"
 futures = "0.3"
 anyhow = "1.0"
 num_cpus = "1.16"
+reqwest = { version = "0.11", features = ["json"] }
 
 [features]
 default = []
 
 [build-dependencies]
-rustc_version = "0.4"
+rustc_version = "0.4"   
