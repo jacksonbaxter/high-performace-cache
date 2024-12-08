@@ -6,7 +6,6 @@ use reqwest;
 
 #[derive(Debug)]
 struct TestResults {
-    operation: String,
     requests: usize,
     failures: usize,
     total_time: Duration,
@@ -120,7 +119,6 @@ async fn run_load_test(operation: TestOperation, num_requests: usize, concurrent
     let requests_per_second = successful_requests as f64 / total_time.as_secs_f64();
     
     TestResults {
-        operation: format!("{:?}", operation),
         requests: successful_requests,
         failures,
         total_time,
