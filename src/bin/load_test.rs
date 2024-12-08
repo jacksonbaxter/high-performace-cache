@@ -2,16 +2,22 @@ use tokio;
 use std::time::{Instant, Duration};
 use futures::future::join_all;
 use std::sync::Arc;
+use reqwest;
 
 #[derive(Debug)]
 struct TestResults {
-    #[allow(dead_code)]
     operation: String,
     requests: usize,
     failures: usize,
     total_time: Duration,
     avg_latency: Duration,
     requests_per_second: f64,
+}
+
+#[derive(Clone, Debug)]
+enum TestOperation {
+    Read,
+    Write,
 }
 
 async fn write_test(client: &reqwest::Client, url: &str, key: &str, value: &str) -> Result<Duration, reqwest::Error> {
@@ -37,48 +43,51 @@ async fn read_test(client: &reqwest::Client, url: &str, key: &str) -> Result<Dur
     Ok(start.elapsed())
 }
 
-#[derive(Clone, Debug)]
-enum TestOperation {
-    Read,
-    Write,
-}
-
 async fn run_load_test(operation: TestOperation, num_requests: usize, concurrent_requests: usize) -> TestResults {
     let client = Arc::new(reqwest::Client::builder()
-        .pool_max_idle_per_host(0) // Close connections immediately
-        .pool_idle_timeout(Some(Duration::from_secs(5)))
+        .pool_max_idle_per_host(200)
+        .pool_idle_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(10))
+        .tcp_keepalive(Duration::from_secs(30))
+        .tcp_nodelay(true)
         .build()
         .unwrap());
-    let url = "http://localhost:8080";
-    let base_value = "test_value_that_is_long_enough_to_be_meaningful_for_testing";
     
+    let url = std::env::var("SERVER_URL")
+        .unwrap_or_else(|_| "http://cache-server:8080".to_string());
+    
+    let base_value = "test";
     let start = Instant::now();
     let mut failures = 0;
     let mut successful_durations = Vec::new();
     
-    // Process requests in batches
-    for batch_start in (0..num_requests).step_by(concurrent_requests) {
-        let batch_size = (batch_start + concurrent_requests).min(num_requests) - batch_start;
-        let mut handles = Vec::with_capacity(batch_size);
+    // Process requests in very large batches with controlled concurrency
+    let batch_size = 1000;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrent_requests));
+    
+    for batch_start in (0..num_requests).step_by(batch_size) {
+        let current_batch_size = (batch_start + batch_size).min(num_requests) - batch_start;
+        let mut handles = Vec::with_capacity(current_batch_size);
         
-        for i in batch_start..batch_start + batch_size {
+        for i in batch_start..batch_start + current_batch_size {
             let client = client.clone();
             let key = format!("test_key_{}", i % concurrent_requests);
             let value = format!("{}_{}", base_value, i);
+            let url = url.clone();
             let op = operation.clone();
+            let semaphore = semaphore.clone();
             
             let handle = tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.unwrap();
                 match op {
-                    TestOperation::Write => write_test(&client, url, &key, &value).await,
-                    TestOperation::Read => read_test(&client, url, &key).await,
+                    TestOperation::Write => write_test(&client, &url, &key, &value).await,
+                    TestOperation::Read => read_test(&client, &url, &key).await,
                 }
             });
             
             handles.push(handle);
         }
         
-        // Wait for batch completion
         let results = join_all(handles).await;
         for result in results {
             match result {
@@ -94,8 +103,8 @@ async fn run_load_test(operation: TestOperation, num_requests: usize, concurrent
             }
         }
         
-        // Add a small delay between batches
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Shorter delay between batches
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     
     let total_time = start.elapsed();
@@ -122,34 +131,33 @@ async fn run_load_test(operation: TestOperation, num_requests: usize, concurrent
 
 #[tokio::main]
 async fn main() {
-    // Use smaller numbers for initial test
+    // Initial population with more data
     println!("\nPopulating initial data...");
-    let initial_results = run_load_test(TestOperation::Write, 50, 5).await;
+    let initial_results = run_load_test(TestOperation::Write, 2000, 500).await;
     println!("Initial population results: {:?}", initial_results);
 
-    // Use more moderate numbers for the main test
-    let num_requests = 5000;  // Reduced from 5000
-    let concurrent_requests = 50;  // Reduced from 50
+    // Even larger test with higher concurrency
+    let num_requests = 20000;
+    let concurrent_requests = 1000;
     
     // Run write test
     println!("\nRunning write test...");
     let write_results = run_load_test(TestOperation::Write, num_requests, concurrent_requests).await;
-    
-    println!("\nWrite Test Results:");
-    println!("Total Requests: {}", write_results.requests);
-    println!("Failed Requests: {}", write_results.failures);
-    println!("Total Time: {:.2?}", write_results.total_time);
-    println!("Average Latency: {:.2?}", write_results.avg_latency);
-    println!("Requests/second: {:.2}", write_results.requests_per_second);
+    print_results("Write", &write_results);
     
     // Run read test
     println!("\nRunning read test...");
     let read_results = run_load_test(TestOperation::Read, num_requests, concurrent_requests).await;
-    
-    println!("\nRead Test Results:");
-    println!("Total Requests: {}", read_results.requests);
-    println!("Failed Requests: {}", read_results.failures);
-    println!("Total Time: {:.2?}", read_results.total_time);
-    println!("Average Latency: {:.2?}", read_results.avg_latency);
-    println!("Requests/second: {:.2}", read_results.requests_per_second);
+    print_results("Read", &read_results);
+}
+
+fn print_results(operation: &str, results: &TestResults) {
+    println!("\n{} Test Results:", operation);
+    println!("Total Requests: {}", results.requests);
+    println!("Failed Requests: {}", results.failures);
+    println!("Total Time: {:.2?}", results.total_time);
+    println!("Average Latency: {:.2?}", results.avg_latency);
+    println!("Requests/second: {:.2}", results.requests_per_second);
+    println!("Success Rate: {:.2}%", 
+        (results.requests as f64 / (results.requests + results.failures) as f64) * 100.0);
 }

@@ -7,6 +7,62 @@ use tokio::sync::RwLock;
 use std::collections::HashMap;
 use thiserror::Error;
 use redis::AsyncCommands;
+use sqlx::postgres::PgPoolOptions;
+use bb8_redis::{bb8, RedisConnectionManager};
+
+#[derive(Clone)]
+pub struct RedisPool {
+    pool: Arc<bb8::Pool<RedisConnectionManager>>,
+}
+
+impl RedisPool {
+    pub async fn new(redis_url: &str) -> Result<Self, redis::RedisError> {
+        let manager = RedisConnectionManager::new(redis_url)?;
+        let pool = bb8::Pool::builder()
+            .max_size(100)  // Increased from 16
+            .min_idle(Some(20))  // Increased from 4
+            .build(manager)
+            .await
+            .map_err(|e| redis::RedisError::from((redis::ErrorKind::IoError, "Pool creation failed", e.to_string())))?;
+
+        Ok(RedisPool {
+            pool: Arc::new(pool),
+        })
+    }
+
+    pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, redis::RedisError> {
+        let mut conn = self.pool.get().await.map_err(|e| {
+            redis::RedisError::from((redis::ErrorKind::IoError, "Failed to get connection", e.to_string()))
+        })?;
+
+        let result: Option<Vec<u8>> = conn.get(key).await?;
+        Ok(result)
+    }
+
+    pub async fn set_ex(&self, key: &str, value: &[u8], ttl: u64) -> Result<(), redis::RedisError> {
+        let mut conn = self.pool.get().await.map_err(|e| {
+            redis::RedisError::from((redis::ErrorKind::IoError, "Failed to get connection", e.to_string()))
+        })?;
+
+        let _: () = redis::cmd("SETEX")
+            .arg(key)
+            .arg(ttl)
+            .arg(value)
+            .query_async(&mut *conn)
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn del(&self, key: &str) -> Result<(), redis::RedisError> {
+        let mut conn = self.pool.get().await.map_err(|e| {
+            redis::RedisError::from((redis::ErrorKind::IoError, "Failed to get connection", e.to_string()))
+        })?;
+
+        let _: () = conn.del(key).await?;
+        Ok(())
+    }
+}
 
 // Error types
 #[derive(Error, Debug)]
@@ -25,7 +81,7 @@ pub enum CacheError {
 }
 
 // Configuration
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Config {
     redis_url: String,
     database_url: String,
@@ -88,9 +144,20 @@ impl MemoryCache {
 // Main cache service
 struct CacheService {
     memory_cache: Arc<RwLock<MemoryCache>>,
-    redis: redis::Client,
+    redis_pool: RedisPool,
     db: PgPool,
     config: Config,
+}
+
+impl Clone for CacheService {
+    fn clone(&self) -> Self {
+        CacheService {
+            memory_cache: self.memory_cache.clone(),
+            redis_pool: self.redis_pool.clone(),
+            db: self.db.clone(),
+            config: self.config.clone(),
+        }
+    }
 }
 
 impl CacheService {
@@ -100,57 +167,65 @@ impl CacheService {
             config.max_memory_items,
         )));
 
-        let redis = redis::Client::open(config.redis_url.clone())?;
+        // Use the new Redis pool
+        let redis_pool = RedisPool::new(&config.redis_url).await?;
         
-        let db = PgPool::connect(&config.database_url)
+        // Configure PostgreSQL pool with more conservative settings
+        let db = PgPoolOptions::new()
+            .max_connections(100)          // Increased from 32
+            .min_connections(20)           // Increased from 4
+            .acquire_timeout(Duration::from_secs(3))
+            .connect(&config.database_url)
             .await
             .map_err(CacheError::Database)?;
 
         Ok(CacheService {
             memory_cache,
-            redis,
+            redis_pool,
             db,
             config,
         })
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, CacheError> {
-        // Try memory cache
+        // Try memory cache first with a read lock
         if let Some(data) = self.memory_cache.read().await.get(key) {
-            tracing::debug!("Cache hit: memory cache for key {}", key);
+            return Ok(data);
+        }
+        
+        // Try Redis and DB lookups concurrently
+        let (redis_result, db_result) = tokio::join!(
+            self.redis_pool.get(key),
+            sqlx::query_as::<_, (Vec<u8>,)>("SELECT data FROM cached_data WHERE key = $1")
+                .bind(key)
+                .fetch_optional(&self.db)
+        );
+
+        // Check Redis result first
+        if let Ok(Some(data)) = redis_result {
+            // Update memory cache in the background
+            let data_clone = data.clone();
+            let key = key.to_string();
+            let memory_cache = self.memory_cache.clone();
+            tokio::spawn(async move {
+                memory_cache.write().await.set(key, data_clone);
+            });
             return Ok(data);
         }
 
-        // Try Redis
-        let mut redis_conn = self.redis.get_async_connection().await?;
-        if let Ok(data) = redis_conn.get::<_, Vec<u8>>(key).await {
-            // Update memory cache
-            self.memory_cache.write().await.set(key.to_string(), data.clone());
-            tracing::debug!("Cache hit: Redis cache for key {}", key);
-            return Ok(data);
-        }
-
-        // Try database
-        let result = sqlx::query_as::<_, (Vec<u8>,)>(
-            "SELECT data FROM cached_data WHERE key = $1"
-        )
-        .bind(key)
-        .fetch_optional(&self.db)
-        .await?;
-
-        match result {
-            Some((data,)) => {  // Note the tuple destructuring here
-                // Update both caches
-                let mut redis_conn = self.redis.get_async_connection().await?;
-                let _: () = redis_conn.set_ex(
-                    key,
-                    &data,
-                    u64::from(self.config.redis_cache_ttl),
-                ).await?;
-
-                self.memory_cache.write().await.set(key.to_string(), data.clone());
-                
-                tracing::debug!("Cache miss: loaded from database for key {}", key);
+        // Check DB result
+        match db_result? {
+            Some((data,)) => {
+                // Update caches in the background
+                let data_clone = data.clone();
+                let key = key.to_string();
+                let redis_pool = self.redis_pool.clone();
+                let memory_cache = self.memory_cache.clone();
+                let ttl = self.config.redis_cache_ttl;
+                tokio::spawn(async move {
+                    let _ = redis_pool.set_ex(&key, &data_clone, ttl).await;
+                    memory_cache.write().await.set(key, data_clone);
+                });
                 Ok(data)
             }
             None => Err(CacheError::NotFound(key.to_string())),
@@ -158,26 +233,28 @@ impl CacheService {
     }
 
     async fn set(&self, key: String, value: Vec<u8>) -> Result<(), CacheError> {
-        // Update database
-        sqlx::query(
-            "INSERT INTO cached_data (key, data) VALUES ($1, $2) 
-             ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data"
-        )
-        .bind(&key)
-        .bind(&value)
-        .execute(&self.db)
-        .await?;
+        // Update all caches concurrently
+        let (db_result, redis_result) = tokio::join!(
+            sqlx::query(
+                "INSERT INTO cached_data (key, data) VALUES ($1, $2) 
+                 ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data"
+            )
+            .bind(&key)
+            .bind(&value)
+            .execute(&self.db),
+            self.redis_pool.set_ex(
+                &key,
+                &value,
+                self.config.redis_cache_ttl
+            )
+        );
 
-        // Update Redis
-        let mut redis_conn = self.redis.get_async_connection().await?;
-        let _: () = redis_conn.set_ex(
-            &key,
-            &value,
-            u64::from(self.config.redis_cache_ttl),
-        ).await?;
-
-        // Update memory cache
+        // Update memory cache immediately (it's the fastest)
         self.memory_cache.write().await.set(key, value);
+
+        // Check results
+        db_result?;
+        redis_result?;
 
         Ok(())
     }
@@ -190,8 +267,7 @@ impl CacheService {
             .await?;
 
         // Remove from Redis
-        let mut redis_conn = self.redis.get_async_connection().await?;
-        let _: () = redis_conn.del(key).await?;
+        self.redis_pool.del(key).await?;
 
         // Remove from memory cache
         self.memory_cache.write().await.data.remove(key);
@@ -203,7 +279,7 @@ impl CacheService {
 // API handlers
 async fn get_cached_data(
     key: web::Path<String>,
-    service: web::Data<Arc<CacheService>>,
+    service: web::Data<CacheService>,
 ) -> Result<HttpResponse, ActixError> {
     match service.get(&key).await {
         Ok(data) => Ok(HttpResponse::Ok().body(data)),
@@ -218,9 +294,9 @@ async fn get_cached_data(
 async fn set_cached_data(
     key: web::Path<String>,
     body: web::Bytes,
-    service: web::Data<Arc<CacheService>>,
+    service: web::Data<CacheService>,
 ) -> Result<HttpResponse, ActixError> {
-    match service.set(key.to_string(), body.to_vec()).await {
+    match service.set(key.into_inner(), body.to_vec()).await {
         Ok(_) => Ok(HttpResponse::Ok().finish()),
         Err(e) => {
             tracing::error!("Error setting cached data: {:?}", e);
@@ -231,7 +307,7 @@ async fn set_cached_data(
 
 async fn delete_cached_data(
     key: web::Path<String>,
-    service: web::Data<Arc<CacheService>>,
+    service: web::Data<CacheService>,
 ) -> Result<HttpResponse, ActixError> {
     match service.delete(&key).await {
         Ok(_) => Ok(HttpResponse::Ok().finish()),
@@ -240,6 +316,10 @@ async fn delete_cached_data(
             Ok(HttpResponse::InternalServerError().finish())
         }
     }
+}
+
+async fn health_check() -> HttpResponse {
+    HttpResponse::Ok().finish()
 }
 
 async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
@@ -339,8 +419,13 @@ async fn main() -> std::io::Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt::init();
 
-    // Create database pool
-    let pool = PgPool::connect(&config.database_url)
+    // Create database pool with optimized settings
+    let pool = PgPoolOptions::new()
+        .max_connections(32)
+        .min_connections(4)
+        .acquire_timeout(Duration::from_secs(3))
+        .idle_timeout(Duration::from_secs(60))
+        .connect(&config.database_url)
         .await
         .expect("Failed to connect to database");
 
@@ -352,27 +437,30 @@ async fn main() -> std::io::Result<()> {
     println!("Database migrations completed successfully");
 
     // Initialize cache service
-    let service = Arc::new(
-        CacheService::new(config)
-            .await
-            .expect("Failed to create cache service")
-    );
+    let cache_service = CacheService::new(config)
+        .await
+        .expect("Failed to create cache service");
 
-    println!("Starting HTTP server at http://127.0.0.1:8080");
+    println!("Starting HTTP server at http://0.0.0.0:8080");
 
-    // Start HTTP server
+    // Start HTTP server with optimized settings
     HttpServer::new(move || {
         App::new()
-            .app_data(web::Data::new(service.clone()))
+            .app_data(web::Data::new(cache_service.clone()))
+            .wrap(actix_web::middleware::Compress::default())
             .service(
                 web::scope("/cache")
+                    .route("/health", web::get().to(health_check))
                     .route("/{key}", web::get().to(get_cached_data))
                     .route("/{key}", web::put().to(set_cached_data))
                     .route("/{key}", web::delete().to(delete_cached_data))
             )
     })
-    .bind("127.0.0.1:8080")?
-    .workers(num_cpus::get())
+    .workers(num_cpus::get() * 2)  // Double the number of workers
+    .backlog(10000)                // Increased from 2048
+    .max_connections(50000)        // Increased from 5000
+    .keep_alive(Duration::from_secs(30))
+    .bind("0.0.0.0:8080")?
     .run()
     .await
 }

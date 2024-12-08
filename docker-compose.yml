@@ -1,0 +1,125 @@
+name: high-performance-cache
+
+services:
+  cache-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: server
+    ports:
+      - "8080:8080"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/cache
+      - MEMORY_CACHE_TTL=60
+      - REDIS_CACHE_TTL=300
+      - MAX_MEMORY_ITEMS=10000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ulimits:
+      nofile:
+        soft: 200000
+        hard: 200000
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 2G
+        reservations:
+          cpus: '2'
+          memory: 1G
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/cache/health" ]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  load-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: load_test
+    environment:
+      - SERVER_URL=http://cache-server:8080
+    depends_on:
+      cache-server:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+
+  postgres:
+    image: postgres:15
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=cache
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+        reservations:
+          cpus: '2'
+          memory: 2G
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    command: >
+      postgres
+        -c shared_buffers=1GB
+        -c effective_cache_size=3GB
+        -c work_mem=32MB
+        -c maintenance_work_mem=256MB
+        -c max_connections=200
+        -c max_parallel_workers_per_gather=4
+        -c max_parallel_workers=8
+        -c max_worker_processes=8
+        -c random_page_cost=1.1
+        -c effective_io_concurrency=200
+        -c checkpoint_completion_target=0.9
+        -c wal_buffers=16MB
+        -c default_statistics_target=100
+        -c synchronous_commit=off
+
+  redis:
+    image: redis:7
+    command: redis-server --maxmemory 1gb --maxmemory-policy allkeys-lru --maxclients 50000
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1.5G
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:
