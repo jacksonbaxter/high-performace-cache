@@ -2,7 +2,10 @@
 This is my first attempt in creating a high performance database system while learning Rust.
 
 ## Features
-- Caching layer non-persistent (e.g. Redis) and persistent layer (e.g. Postgres SQL). Pick one of these strategies or come up with your own: cache-aside, query caching, write-behind, write-through, or cache prefetching. (See https://redis.com/wp-content/uploads/2023/04/redis-enterprise-for-caching.pdf)
+- Caching layer non-persistent (e.g. Redis) and persistent layer (e.g. Postgres SQL). (See https://redis.com/wp-content/uploads/2023/04/redis-enterprise-for-caching.pdf)
+    - In-memory cache (fastest, but volatile)
+    - Redis cache (medium speed, distributed)
+    - PostgreSQL database (persistent storage)
 - Support 5000 read requests per second with subsecond average latency on each request.
 - Support 5000 write requests per second with subsecond average latency on each request.
 - High Concurrency
