@@ -29,3 +29,27 @@ docker-compose down --volumes --remove-orphans
 # Rebuild and start
 docker-compose up --build
 ```
+
+## How to Use Basic CRUD Operations
+Store a value in cache
+```bash
+# PUT request to store data
+curl -X PUT -H "Content-Type: application/json" \
+  --data '{"some":"data"}' \
+  http://localhost:8080/cache/mykey
+```
+Retrieve a value
+```bash
+# GET request to retrieve data
+curl http://localhost:8080/cache/mykey
+```
+Delete a value
+```bash
+# DELETE request to remove data
+curl -X DELETE http://localhost:8080/cache/mykey
+```
+Check health
+```bash
+# Health check endpoint
+curl http://localhost:8080/cache/health
+```
